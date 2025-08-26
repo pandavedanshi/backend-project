@@ -7,3 +7,4 @@ sentence-transformers==3.0.1
 # faiss-cpu==1.8.0   <-- REMOVE THIS (not supported on 3.13)
 chromadb==0.5.0      # use Chroma instead of Faiss
 numpy>=2.0.0
+beautifulsoup4
