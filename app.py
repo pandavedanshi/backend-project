@@ -2,7 +2,6 @@ import os
 import io
 import json
 import time
-import pickle
 from typing import List, Dict, Optional, Tuple
 from urllib.parse import urlparse
 
@@ -10,13 +9,22 @@ import numpy as np
 import requests
 from bs4 import BeautifulSoup
 from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException, Body
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from groq import Groq
 
-# Embeddings + Vector DB
-import faiss
+# ----------------- Patch NumPy 2.x -----------------
+if not hasattr(np, "float_"):
+    np.float_ = np.float64
+if not hasattr(np, "int_"):
+    np.int_ = np.int64
+if not hasattr(np, "uint"):
+    np.uint = np.uint64
+
+# Vector DB + Embeddings
+import chromadb
+from chromadb.api.types import EmbeddingFunction
 from sentence_transformers import SentenceTransformer
 from pypdf import PdfReader
 
@@ -53,53 +61,24 @@ app.add_middleware(
 
 client = Groq(api_key=GROQ_API_KEY)
 
-# ----------------- Vector Store Wrapper -----------------
+# ----------------- Chroma Vector Store -----------------
 
-class VectorStore:
-    def __init__(self, dim: int):
-        self.dim = dim
-        self.index = faiss.IndexFlatIP(dim)  # use inner product on normalized vectors = cosine
-        self.texts: List[str] = []
-        self.metas: List[Dict] = []
-        self._is_normalized = False
+chroma_client = chromadb.PersistentClient(path=INDEX_DIR)
+sentence_embedder = SentenceTransformer(EMBED_MODEL_NAME)
 
-    def add(self, embeddings: np.ndarray, texts: List[str], metas: List[Dict]):
-        assert embeddings.shape[0] == len(texts) == len(metas)
-        # normalize to use cosine similarity with IndexFlatIP
-        faiss.normalize_L2(embeddings)
-        self.index.add(embeddings.astype(np.float32))
-        self.texts.extend(texts)
-        self.metas.extend(metas)
-        self._is_normalized = True
+class SentenceTransformerEmbeddingFunction(EmbeddingFunction):
+    def __init__(self, model):
+        self.model = model
 
-    def search(self, query_emb: np.ndarray, k: int) -> List[Tuple[float, str, Dict]]:
-        if query_emb.ndim == 1:
-            query_emb = query_emb[None, :]
-        faiss.normalize_L2(query_emb)
-        scores, idxs = self.index.search(query_emb.astype(np.float32), k)
-        out = []
-        for score, idx in zip(scores[0], idxs[0]):
-            if idx == -1:
-                continue
-            out.append((float(score), self.texts[idx], self.metas[idx]))
-        return out
+    def __call__(self, input: List[str]) -> List[List[float]]:
+        return self.model.encode(input, convert_to_numpy=True).tolist()
 
-    def save(self, path: str):
-        os.makedirs(path, exist_ok=True)
-        faiss.write_index(self.index, os.path.join(path, "faiss.index"))
-        with open(os.path.join(path, "store.pkl"), "wb") as f:
-            pickle.dump({"texts": self.texts, "metas": self.metas, "dim": self.dim}, f)
+embed_fn = SentenceTransformerEmbeddingFunction(sentence_embedder)
 
-    @staticmethod
-    def load(path: str) -> "VectorStore":
-        with open(os.path.join(path, "store.pkl"), "rb") as f:
-            obj = pickle.load(f)
-        vs = VectorStore(obj["dim"])
-        vs.index = faiss.read_index(os.path.join(path, "faiss.index"))
-        vs.texts = obj["texts"]
-        vs.metas = obj["metas"]
-        vs._is_normalized = True
-        return vs
+collection = chroma_client.get_or_create_collection(
+    name="rag_store",
+    embedding_function=embed_fn
+)
 
 # ----------------- File Reading Helpers -----------------
 
@@ -149,74 +128,49 @@ def chunk_text(text: str, chunk_size: int = CHUNK_SIZE, chunk_overlap: int = CHU
 # ----------------- RAG Engine -----------------
 
 class RAGEngine:
-    def __init__(self, embed_model_name: str, index_dir: str):
-        self.embedder = SentenceTransformer(embed_model_name)
-        self.dim = self.embedder.get_sentence_embedding_dimension()
-        self.index_dir = index_dir
-        self.vs: Optional[VectorStore] = None
+    def __init__(self, collection):
+        self.collection = collection
 
     def build_or_load(self, data_dir: str) -> str:
-        faiss_file = os.path.join(self.index_dir, "faiss.index")
-        store_file = os.path.join(self.index_dir, "store.pkl")
-
-        if os.path.exists(faiss_file) and os.path.exists(store_file):
-            self.vs = VectorStore.load(self.index_dir)
-            return "loaded"
-
         corpus = load_corpus_from_dir(data_dir)
         if not corpus:
-            self.vs = VectorStore(self.dim)
-            self.vs.save(self.index_dir)
-            return "built-empty"
+            return "empty"
 
-        texts, metas = [], []
         for src, content in corpus:
             chunks = chunk_text(content)
-            for i, ch in enumerate(chunks):
-                texts.append(ch)
-                metas.append({"source": src, "chunk_id": i})
-
-        embeddings = self.embedder.encode(
-            texts, convert_to_numpy=True, normalize_embeddings=False, batch_size=64, show_progress_bar=True
-        )
-        vs = VectorStore(self.dim)
-        vs.add(embeddings, texts, metas)
-        vs.save(self.index_dir)
-        self.vs = vs
+            if not chunks:
+                continue
+            ids = [f"{src}-{i}" for i in range(len(chunks))]
+            self.collection.add(
+                documents=chunks,
+                metadatas=[{"source": src, "chunk_id": i} for i in range(len(chunks))],
+                ids=ids
+            )
         return "built"
 
     def add_documents(self, docs: List[Tuple[str, str]]) -> int:
-        """
-        Add (source_path, content) pairs to existing vector store (or create new).
-        Returns number of chunks added.
-        """
-        if self.vs is None:
-            self.vs = VectorStore(self.dim)
-
-        new_texts, new_metas = [], []
+        total_chunks = 0
         for src, content in docs:
             chunks = chunk_text(content)
-            for i, ch in enumerate(chunks):
-                new_texts.append(ch)
-                new_metas.append({"source": src, "chunk_id": i})
-
-        if not new_texts:
-            return 0
-
-        embeddings = self.embedder.encode(new_texts, convert_to_numpy=True, normalize_embeddings=False, batch_size=64)
-        self.vs.add(embeddings, new_texts, new_metas)
-        self.vs.save(self.index_dir)
-        return len(new_texts)
+            if not chunks:
+                continue
+            ids = [f"{src}-{int(time.time())}-{i}" for i in range(len(chunks))]
+            self.collection.add(
+                documents=chunks,
+                metadatas=[{"source": src, "chunk_id": i} for i in range(len(chunks))],
+                ids=ids
+            )
+            total_chunks += len(chunks)
+        return total_chunks
 
     def retrieve(self, query: str, k: int = TOP_K) -> List[Tuple[float, str, Dict]]:
-        if self.vs is None:
-            raise RuntimeError("Vector store not initialized")
-        q_emb = self.embedder.encode([query], convert_to_numpy=True, normalize_embeddings=False)[0]
-        return self.vs.search(q_emb, k=k)
+        results = self.collection.query(query_texts=[query], n_results=k)
+        out = []
+        for score, text, meta in zip(results["distances"][0], results["documents"][0], results["metadatas"][0]):
+            out.append((float(score), text, meta))
+        return out
 
-# ----------------- Instantiate RAG -----------------
-
-rag = RAGEngine(EMBED_MODEL_NAME, INDEX_DIR)
+rag = RAGEngine(collection)
 status = rag.build_or_load(DATA_DIR)
 print(f"[RAG] Index status: {status}")
 
@@ -251,20 +205,19 @@ RAG_SYSTEM_INSTRUCTION = (
 
 def build_context_block(hits: List[Tuple[float, str, Dict]]) -> str:
     blocks = []
-    for score, text, meta in hits:
+    for _, text, meta in hits:
         src = os.path.basename(meta.get("source", "unknown"))
         cid = meta.get("chunk_id", -1)
         blocks.append(f"[{src}#{cid}] {text}")
     return "\n\n".join(blocks)
 
 def make_augmented_messages(conv: Conversation, user_query: str) -> List[Dict[str, str]]:
-    hits = rag.retrieve(user_query, k=TOP_K) if rag.vs and len(rag.vs.texts) > 0 else []
+    hits = rag.retrieve(user_query, k=TOP_K)
     context = build_context_block(hits) if hits else "No relevant context found."
 
     msgs = []
     msgs.append({"role": "system", "content": RAG_SYSTEM_INSTRUCTION})
     msgs.append({"role": "system", "content": f"Context:\n{context}"})
-    # keep a bit of recent history for coherence
     last_history = [m for m in conv.messages if m["role"] in ("user", "assistant")][-6:]
     msgs.extend(last_history)
     msgs.append({"role": "user", "content": user_query})
@@ -306,38 +259,62 @@ def safe_filename_for_url(url: str) -> str:
     host = parsed.netloc.replace(":", "_")
     path = parsed.path.strip("/").replace("/", "_") or "root"
     fname = f"{host}_{path}.txt"
-    # remove illegal chars
     return "".join(c for c in fname if c.isalnum() or c in ("_", ".", "-"))
+
+# ----------------- Auto-Ingest Apple Watch URLs -----------------
+
+APPLE_WATCH_URLS = [
+    "https://www.apple.com/apple-watch-series-10/",
+    "https://www.apple.com/apple-watch-ultra-2/",
+    "https://www.apple.com/watchos/"
+]
+
+def auto_ingest_apple_watch():
+    for url in APPLE_WATCH_URLS:
+        try:
+            fname = safe_filename_for_url(url)
+            dest = os.path.join(DATA_DIR, fname + ".txt")
+            if not os.path.exists(dest):  # only ingest once
+                print(f"[Auto-Ingest] Fetching {url}")
+                text = fetch_and_clean(url)
+                with open(dest, "w", encoding="utf-8") as f:
+                    f.write(text)
+                rag.add_documents([(dest, text)])
+                print(f"[Auto-Ingest] Added {url}")
+            else:
+                print(f"[Auto-Ingest] Skipping {url} (already ingested)")
+        except Exception as e:
+            print(f"[Auto-Ingest] Failed {url}: {e}")
+
+@app.on_event("startup")
+def startup_event():
+    auto_ingest_apple_watch()
+    print("[Startup] Auto-ingest completed.")
 
 # ----------------- Routes -----------------
 
 @app.get("/health")
 def health():
-    docs_indexed = len(rag.vs.texts) if (rag.vs and hasattr(rag.vs, "texts")) else 0
-    return {"ok": True, "index_status": status, "docs_indexed": docs_indexed}
+    count = collection.count()
+    return {"ok": True, "index_status": status, "docs_indexed": count}
 
 @app.post("/reindex")
 def reindex():
-    # remove current index files and rebuild from DATA_DIR
-    for fn in ("faiss.index", "store.pkl"):
-        try:
-            os.remove(os.path.join(INDEX_DIR, fn))
-        except FileNotFoundError:
-            pass
+    chroma_client.delete_collection("rag_store")
+    global collection
+    collection = chroma_client.get_or_create_collection(
+        name="rag_store",
+        embedding_function=embed_fn
+    )
     stat = rag.build_or_load(DATA_DIR)
-    docs_indexed = len(rag.vs.texts) if rag.vs else 0
-    return {"status": stat, "docs_indexed": docs_indexed}
+    return {"status": stat, "docs_indexed": collection.count()}
 
 class IngestURLRequest(BaseModel):
     url: str
-    save_filename: Optional[str] = None  # optional custom name inside data/
+    save_filename: Optional[str] = None
 
 @app.post("/ingest_url")
 def ingest_url(payload: IngestURLRequest):
-    """
-    Fetch a webpage, save cleaned text to DATA_DIR, then chunk+index it immediately.
-    Returns number of chunks added.
-    """
     try:
         text = fetch_and_clean(payload.url)
     except Exception as e:
@@ -348,14 +325,12 @@ def ingest_url(payload: IngestURLRequest):
 
     fname = payload.save_filename or safe_filename_for_url(payload.url)
     dest = os.path.join(DATA_DIR, fname)
-    # ensure .txt extension
     if not dest.lower().endswith(".txt"):
         dest = dest + ".txt"
 
     with open(dest, "w", encoding="utf-8") as f:
         f.write(text)
 
-    # add to vector store immediately
     added = rag.add_documents([(dest, text)])
     return {"status": "ingested", "file": dest, "chunks_added": added}
 
@@ -369,19 +344,7 @@ async def chat(input: UserInput):
     rag_messages = make_augmented_messages(conversation, input.message)
     response = query_groq(rag_messages)
 
-    # Update conversation memory (only keep the short chat history)
     conversation.messages.append({"role": input.role, "content": input.message})
     conversation.messages.append({"role": "assistant", "content": response})
 
     return {"response": response, "conversation_id": input.conversation_id}
-
-# ----------------- Run Instructions -----------------
-# Start with:
-#   uvicorn app:app --reload
-#
-# Example ingestion:
-#   POST /ingest_url  { "url": "https://www.apple.com/apple-watch-series-10/" }
-#
-# Example chat:
-#   POST /chat/ { "message": "What's the battery life of the Apple Watch Series 10?", "conversation_id": "apple_demo" }
-#
